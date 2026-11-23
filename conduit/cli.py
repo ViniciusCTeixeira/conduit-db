@@ -7,8 +7,19 @@ import click
 import pymysql
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
+from rich.text import Text
 
 from conduit import __version__
 from conduit.checkpoint import CheckpointStore
@@ -22,6 +33,35 @@ from conduit.writer import DataWriter
 
 
 console = Console()
+
+
+class TableNameColumn(ProgressColumn):
+    """Renders table name with consistent padding for clean column alignment."""
+
+    def render(self, task) -> Text:
+        tname = task.fields.get("table", task.description)
+        is_total = task.fields.get("unit") == "tabelas"
+        style = "bold magenta" if is_total else "bold cyan"
+        return Text(f"{tname:<22}", style=style)
+
+
+class ProgressCounterColumn(ProgressColumn):
+    """Renders completed and total count with dynamic unit (rows or tables)."""
+
+    def render(self, task) -> Text:
+        unit = task.fields.get("unit", "linhas")
+        return Text(f"{task.completed:,}/{task.total:,} {unit}", style="white")
+
+
+class RowsSpeedColumn(ProgressColumn):
+    """Renders transfer throughput in rows per second with styling."""
+
+    def render(self, task) -> Text:
+        if task.fields.get("unit") == "tabelas":
+            return Text("")
+        if task.speed is None:
+            return Text("-- rows/s", style="dim yellow")
+        return Text(f"{task.speed:,.0f} rows/s", style="bold yellow")
 
 
 def get_db_connection(cfg: DatabaseConfig, host_override: str, port_override: int) -> pymysql.Connection:
@@ -39,11 +79,21 @@ def get_db_connection(cfg: DatabaseConfig, host_override: str, port_override: in
     )
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="conduit-db")
-def cli() -> None:
+@click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
+@click.pass_context
+def cli(ctx: click.Context, config_path: Optional[str]) -> None:
     """ConduitDB: Resilient, high-throughput, and resumable database migration CLI."""
-    pass
+    if ctx.invoked_subcommand is None:
+        interactive_menu(config_path)
+
+
+@cli.command("menu")
+@click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
+def menu_cmd(config_path: Optional[str]) -> None:
+    """Launches the interactive wizard menu."""
+    interactive_menu(config_path)
 
 
 @cli.command("test")
@@ -213,20 +263,32 @@ def transfer_cmd(
                     table_list = inspector.list_tables()
                     table_list = inspector.sort_tables_topologically(table_list)
 
-                console.print(Panel(f"Transferring {len(table_list)} tables: [cyan]{source}[/] -> [green]{target}[/] (Batch: {chunk_size:,})", title="ConduitDB Transfer"))
+                console.print(Panel(
+                    f"Transferring {len(table_list)} tables: [cyan]{source}[/] -> [green]{target}[/] (Batch: {chunk_size:,})",
+                    title="ConduitDB Transfer",
+                ))
 
                 progress = Progress(
                     SpinnerColumn(),
-                    TextColumn("[bold cyan]{task.fields[table]}[/]"),
+                    TableNameColumn(),
                     BarColumn(),
                     TaskProgressColumn(),
-                    TextColumn("{task.completed:,}/{task.total:,}"),
+                    ProgressCounterColumn(),
+                    RowsSpeedColumn(),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
                     console=console,
                 )
 
                 with progress:
+                    overall_task = progress.add_task(
+                        "Progresso Total",
+                        total=len(table_list),
+                        completed=0,
+                        table="[Progresso Geral]",
+                        unit="tabelas",
+                    ) if len(table_list) > 1 else None
+
                     for table_name in table_list:
                         meta = inspector.get_table_metadata(table_name)
                         exact_count = inspector.get_exact_row_count(table_name)
@@ -241,6 +303,8 @@ def transfer_cmd(
 
                         if cp.status == "COMPLETED" and not truncate:
                             console.print(f"  [dim]Skipping already completed table: [cyan]{table_name}[/] ({cp.migrated_rows:,} rows)[/]")
+                            if overall_task is not None:
+                                progress.advance(overall_task, 1)
                             continue
 
                         if truncate:
@@ -249,7 +313,13 @@ def transfer_cmd(
                             cp.last_cursor_value = None
                             cp.migrated_rows = 0
 
-                        task_id = progress.add_task("Transferring", total=exact_count, completed=cp.migrated_rows, table=table_name)
+                        task_id = progress.add_task(
+                            "Transferring",
+                            total=exact_count,
+                            completed=cp.migrated_rows,
+                            table=table_name,
+                            unit="linhas",
+                        )
 
                         try:
                             resume_cursor = cp.last_cursor_value
@@ -259,6 +329,8 @@ def transfer_cmd(
                                 progress.advance(task_id, len(rows_chunk))
 
                             store.mark_completed(job_id, table_name)
+                            if overall_task is not None:
+                                progress.advance(overall_task, 1)
                         except Exception as e:
                             store.mark_failed(job_id, table_name, str(e))
                             console.print(f"[bold red]Failed on table {table_name}: {e}[/]")
@@ -277,9 +349,7 @@ def transfer_cmd(
 @click.option("--chunk-size", default=5000, help="Batch size per operation.")
 @click.option("--state-db", default=".conduit_state.db", help="Path to SQLite checkpoint database.")
 @click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
-@click.pass_context
 def resume_cmd(
-    ctx: click.Context,
     source: Optional[str],
     target: Optional[str],
     chunk_size: int,
@@ -299,11 +369,13 @@ def resume_cmd(
     dst_name = target or job["target_name"].split(":")[0]
     console.print(f"[bold cyan]Resuming job:[/] {job['job_id']} ([cyan]{src_name}[/] -> [green]{dst_name}[/])")
 
-    ctx.invoke(
-        transfer_cmd,
+    transfer_cmd.callback(
         source=src_name,
         target=dst_name,
+        tables=None,
         chunk_size=chunk_size,
+        truncate=False,
+        upsert=False,
         state_db=state_db,
         config_path=config_path,
     )
@@ -390,6 +462,141 @@ def reset_cmd(source: str, target: str, state_db: str) -> None:
     job_id = job["job_id"] if job else f"{source}_to_{target}"
     store.reset_job(job_id)
     console.print(f"[bold yellow]Checkpoint state cleared for job:[/] {job_id}")
+
+
+def select_profile(prompt_text: str, profiles: dict[str, DatabaseConfig], default: Optional[str] = None) -> str:
+    """Helper to select a database profile with interactive prompt."""
+    names = list(profiles.keys())
+    if not names:
+        raise ValueError("Nenhum perfil configurado.")
+    if len(names) == 1:
+        return names[0]
+    if default not in names:
+        default = names[0]
+    return Prompt.ask(prompt_text, choices=names, default=default)
+
+
+def interactive_menu(config_path: Optional[str] = None) -> None:
+    """Displays an interactive terminal wizard menu."""
+    try:
+        profiles = ConfigManager.load_profiles(config_path)
+    except Exception as e:
+        console.print(Panel(
+            f"[bold red]Erro ao carregar perfis:[/] {e}\n\n"
+            "[yellow]Dica:[/] Crie o arquivo [bold cyan]profiles.yaml[/] a partir de [bold cyan]profiles.example.yaml[/].",
+            title="[bold yellow]ConduitDB - Configuração Ausente[/]",
+            border_style="yellow",
+        ))
+        return
+
+    profile_names = list(profiles.keys())
+    if not profile_names:
+        console.print(Panel(
+            "[bold yellow]Nenhum perfil de banco de dados encontrado![/]\n\n"
+            "Crie o arquivo [bold cyan]profiles.yaml[/] a partir de [bold cyan]profiles.example.yaml[/] para configurar os bancos.",
+            title="[bold yellow]ConduitDB - Configuração Necessária[/]",
+            border_style="yellow",
+        ))
+        return
+
+    console.print(Panel.fit(
+        f"[bold cyan]ConduitDB {__version__}[/] - [dim]Migração e Sincronização Resiliente de Bancos de Dados[/]\n"
+        f"[yellow]Perfis carregados:[/] {', '.join(f'[bold green]{p}[/]' for p in profile_names)}",
+        border_style="cyan",
+    ))
+
+    while True:
+        try:
+            console.print("\n[bold cyan]── Menu Principal ────────────────────────────────────────────────[/]")
+            console.print("  [bold yellow]1[/]  🔍  [bold]Inspecionar banco de dados[/] (tabelas, chaves e linhas)")
+            console.print("  [bold yellow]2[/]  🔗  [bold]Testar conectividade e túneis SSH[/] (Source <-> Target)")
+            console.print("  [bold yellow]3[/]  📐  [bold]Sincronizar estrutura (DDL)[/] (CREATE TABLE com FKs diferidas)")
+            console.print("  [bold yellow]4[/]  🚀  [bold]Iniciar migração de dados[/] (Streaming com barra de progresso)")
+            console.print("  [bold yellow]5[/]  ⏯️   [bold]Retomar migração interrompida[/] (Resume a partir do checkpoint)")
+            console.print("  [bold yellow]6[/]  ✅  [bold]Auditar e verificar integridade[/] (Contagem e CRC32)")
+            console.print("  [bold yellow]7[/]  🧹  [bold]Limpar estado de checkpoint[/] (Reset)")
+            console.print("  [bold yellow]0[/]  🚪  [bold]Sair[/]")
+
+            choice = Prompt.ask("\n[bold]Escolha uma operação[/]", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Operação encerrada.[/]")
+            break
+
+        if choice == "0":
+            console.print("[dim]Encerrando ConduitDB.[/]")
+            break
+
+        try:
+            if choice == "1":
+                p = select_profile("Selecione o perfil para inspecionar", profiles)
+                inspect_cmd.callback(profile=p, config_path=config_path)
+
+            elif choice == "2":
+                src = select_profile("Selecione o perfil de Origem (Source)", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Selecione o perfil de Destino (Target)", profiles, default=dst_default)
+                test_cmd.callback(source=src, target=dst, config_path=config_path)
+
+            elif choice == "3":
+                src = select_profile("Origem (Source)", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Destino (Target)", profiles, default=dst_default)
+                drop = Confirm.ask("Deseja recriar as tabelas no destino se já existirem? (--drop)", default=False)
+                schema_cmd.callback(source=src, target=dst, drop=drop, config_path=config_path)
+
+            elif choice == "4":
+                src = select_profile("Origem (Source)", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Destino (Target)", profiles, default=dst_default)
+                chunk_sz = IntPrompt.ask("Tamanho do lote por operação (chunk-size)", default=5000)
+                t_input = Prompt.ask("Tabelas específicas (separadas por vírgula, ou Enter para todas)", default="").strip()
+                selected_tables = t_input if t_input else None
+                trunc = Confirm.ask("Truncar tabelas no destino antes de migrar?", default=False)
+                ups = Confirm.ask("Usar UPSERT (ON DUPLICATE KEY UPDATE)?", default=False)
+
+                transfer_cmd.callback(
+                    source=src,
+                    target=dst,
+                    tables=selected_tables,
+                    chunk_size=chunk_sz,
+                    truncate=trunc,
+                    upsert=ups,
+                    state_db=".conduit_state.db",
+                    config_path=config_path,
+                )
+
+            elif choice == "5":
+                resume_cmd.callback(
+                    source=None,
+                    target=None,
+                    chunk_size=5000,
+                    state_db=".conduit_state.db",
+                    config_path=config_path,
+                )
+
+            elif choice == "6":
+                src = select_profile("Origem (Source)", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Destino (Target)", profiles, default=dst_default)
+                t_input = Prompt.ask("Tabelas específicas (separadas por vírgula, ou Enter para todas)", default="").strip()
+                selected_tables = t_input if t_input else None
+                do_hash = Confirm.ask("Calcular checksum CRC32 completo nas linhas?", default=True)
+                verify_cmd.callback(
+                    source=src,
+                    target=dst,
+                    tables=selected_tables,
+                    check_hash=do_hash,
+                    config_path=config_path,
+                )
+
+            elif choice == "7":
+                src = select_profile("Origem (Source)", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Destino (Target)", profiles, default=dst_default)
+                reset_cmd.callback(source=src, target=dst, state_db=".conduit_state.db")
+
+        except Exception as err:
+            console.print(f"[bold red]Erro durante a operação:[/] {err}")
 
 
 if __name__ == "__main__":
