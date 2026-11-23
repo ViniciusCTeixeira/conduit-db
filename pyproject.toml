@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conduit-db"
+version = "1.0.0"
+description = "Resilient, high-throughput, and resumable database migration CLI for MySQL and MariaDB with native SSH tunneling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "ConduitDB Contributors" }
+]
+dependencies = [
+    "pymysql>=1.1.0",
+    "cryptography>=42.0.0",
+    "sshtunnel>=0.4.0",
+    "paramiko>=3.4.0",
+    "rich>=13.7.0",
+    "pyyaml>=6.0.1",
+    "click>=8.1.7",
+]
+
+[project.scripts]
+conduit = "conduit.cli:cli"

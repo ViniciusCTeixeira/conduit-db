@@ -1,0 +1,30 @@
+# ConduitDB Profiles Configuration Example
+# Copy this file to profiles.yaml and fill in your connection details.
+
+profiles:
+  source_db:
+    driver: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: db_user
+    password: "${SOURCE_DB_PASSWORD}"
+    database: my_source_database
+    charset: utf8mb4
+    ssh:
+      enabled: false
+      host: 192.168.1.100
+      port: 22
+      username: ssh_user
+      private_key: ~/.ssh/id_rsa
+      # password: "${SSH_PASSWORD}"
+
+  target_db:
+    driver: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "${TARGET_DB_PASSWORD}"
+    database: my_target_database
+    charset: utf8mb4
+    ssh:
+      enabled: false

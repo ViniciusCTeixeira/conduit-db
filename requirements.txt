@@ -1,0 +1,8 @@
+pymysql>=1.1.0
+cryptography>=42.0.0
+sshtunnel>=0.4.0
+paramiko>=3.4.0
+rich>=13.7.0
+pyyaml>=6.0.1
+click>=8.1.7
+pytest>=8.0.0
