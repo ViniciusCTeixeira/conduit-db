@@ -37,12 +37,12 @@ profiles:
     runner = CliRunner()
     result = runner.invoke(cli, ["--config", str(cfg_file)], input="0\n")
     assert result.exit_code == 0
-    assert "Menu Principal" in result.output
-    assert "Encerrando ConduitDB" in result.output
+    assert "Main Menu" in result.output
+    assert "Exiting ConduitDB" in result.output
 
 
 def test_cli_interactive_menu_missing_config(tmp_path):
     runner = CliRunner()
     result = runner.invoke(cli, ["--config", str(tmp_path / "nonexistent.yaml")])
     assert result.exit_code == 0
-    assert "Nenhum perfil de banco de dados encontrado" in result.output
+    assert "No database profiles found" in result.output
