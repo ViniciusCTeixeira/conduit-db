@@ -24,9 +24,10 @@ from rich.text import Text
 from conduit import __version__
 from conduit.checkpoint import CheckpointStore
 from conduit.config import ConfigManager, DatabaseConfig
-from conduit.inspector import DatabaseInspector
+from conduit.inspector import DatabaseInspector, IndexInfo, TableMeta
 from conduit.schema import SchemaMigrator
 from conduit.streamer import DataStreamer
+from conduit.synchronizer import DataSynchronizer, TableSyncStats
 from conduit.tunnel import TunnelManager
 from conduit.verifier import DataVerifier
 from conduit.writer import DataWriter
@@ -228,6 +229,8 @@ def schema_cmd(source: str, target: str, drop: bool, config_path: Optional[str])
 @click.option("--chunk-size", default=5000, help="Batch size per operation / transaction.")
 @click.option("--truncate", is_flag=True, default=False, help="Truncate target table before migration.")
 @click.option("--upsert", is_flag=True, default=False, help="Use ON DUPLICATE KEY UPDATE instead of plain insert.")
+@click.option("--auto-index/--no-auto-index", default=True, help="Temporarily drop secondary indexes for big tables.")
+@click.option("--index-threshold", default=100000, type=int, help="Threshold to drop secondary indexes.")
 @click.option("--state-db", default=".conduit_state.db", help="Path to SQLite checkpoint database.")
 @click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
 def transfer_cmd(
@@ -237,6 +240,8 @@ def transfer_cmd(
     chunk_size: int,
     truncate: bool,
     upsert: bool,
+    auto_index: bool,
+    index_threshold: int,
     state_db: str,
     config_path: Optional[str],
 ) -> None:
@@ -313,6 +318,20 @@ def transfer_cmd(
                             cp.last_cursor_value = None
                             cp.migrated_rows = 0
 
+                        # Smart Indexing: Pre-Stream Phase
+                        if auto_index and exact_count >= index_threshold:
+                            tgt_inspector = DatabaseInspector(dst_conn, dst_cfg.database)
+                            sec_indexes = tgt_inspector.get_secondary_indexes(table_name)
+                            if sec_indexes:
+                                console.print(f"  [yellow]⚡ Smart Indexing:[/] Temporarily dropping {len(sec_indexes)} secondary indexes on [green]{table_name}[/] to maximize bulk write throughput...")
+                                for s_idx in sec_indexes:
+                                    try:
+                                        store.record_dropped_index(job_id, table_name, s_idx.name, s_idx.definition)
+                                        writer.drop_secondary_index(table_name, s_idx.name)
+                                        console.print(f"    [dim yellow]Dropped index:[/] {s_idx.name}")
+                                    except Exception as idx_err:
+                                        console.print(f"    [dim yellow]Warning: Could not drop index {s_idx.name}: {idx_err}[/]")
+
                         task_id = progress.add_task(
                             "Transferring",
                             total=exact_count,
@@ -331,6 +350,18 @@ def transfer_cmd(
                             store.mark_completed(job_id, table_name)
                             if overall_task is not None:
                                 progress.advance(overall_task, 1)
+
+                            # Smart Indexing: Post-Stream Phase
+                            pending_indexes = store.get_dropped_indexes(job_id, table_name)
+                            if pending_indexes:
+                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes on [green]{table_name}[/] via bulk index creation...")
+                                for p_idx in pending_indexes:
+                                    try:
+                                        writer.recreate_secondary_index(table_name, p_idx["definition"])
+                                        store.mark_index_restored(job_id, table_name, p_idx["index_name"])
+                                        console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
+                                    except Exception as r_err:
+                                        console.print(f"    [bold red]✖ Failed to restore index {p_idx['index_name']}: {r_err}[/]")
                         except Exception as e:
                             store.mark_failed(job_id, table_name, str(e))
                             console.print(f"[bold red]Failed on table {table_name}: {e}[/]")
@@ -347,12 +378,16 @@ def transfer_cmd(
 @click.option("--source", default=None, help="Source profile (optional if inferred).")
 @click.option("--target", default=None, help="Target profile (optional if inferred).")
 @click.option("--chunk-size", default=5000, help="Batch size per operation.")
+@click.option("--auto-index/--no-auto-index", default=True, help="Temporarily drop secondary indexes for big tables.")
+@click.option("--index-threshold", default=100000, type=int, help="Threshold to drop secondary indexes.")
 @click.option("--state-db", default=".conduit_state.db", help="Path to SQLite checkpoint database.")
 @click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
 def resume_cmd(
     source: Optional[str],
     target: Optional[str],
     chunk_size: int,
+    auto_index: bool,
+    index_threshold: int,
     state_db: str,
     config_path: Optional[str],
 ) -> None:
@@ -376,6 +411,8 @@ def resume_cmd(
         chunk_size=chunk_size,
         truncate=False,
         upsert=False,
+        auto_index=auto_index,
+        index_threshold=index_threshold,
         state_db=state_db,
         config_path=config_path,
     )
@@ -464,6 +501,210 @@ def reset_cmd(source: str, target: str, state_db: str) -> None:
     console.print(f"[bold yellow]Checkpoint state cleared for job:[/] {job_id}")
 
 
+@cli.command("sync")
+@click.option("--source", "-s", required=True, help="Source profile name.")
+@click.option("--target", "-t", required=True, help="Target profile name.")
+@click.option("--tables", default=None, help="Comma-separated table list to synchronize.")
+@click.option("--chunk-size", default=5000, type=int, help="Batch size for windowed checksum.")
+@click.option("--prune/--no-prune", default=False, help="Delete target rows missing from source.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview diff counts without modifying target.")
+@click.option("--auto-index/--no-auto-index", default=True, help="Temporarily drop secondary indexes for big tables.")
+@click.option("--index-threshold", default=100000, type=int, help="Row threshold to trigger index optimization.")
+@click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
+def sync_cmd(
+    source: str,
+    target: str,
+    tables: Optional[str],
+    chunk_size: int,
+    prune: bool,
+    dry_run: bool,
+    auto_index: bool,
+    index_threshold: int,
+    config_path: Optional[str],
+) -> None:
+    """Differential synchronization: compares checksums and synchronizes INSERT, UPDATE, and DELETE."""
+    profiles = ConfigManager.load_profiles(config_path)
+    src_cfg = profiles[source]
+    dst_cfg = profiles[target]
+
+    store = CheckpointStore()
+    job_id = store.get_or_create_job(f"{source}:{src_cfg.database}", f"{target}:{dst_cfg.database}")
+
+    mode_label = "[bold yellow]DRY RUN[/] " if dry_run else ""
+    prune_label = "[bold red]PRUNE ENABLED[/]" if prune else "prune disabled"
+
+    console.print(Panel(
+        f"{mode_label}Synchronizing: [cyan]{source}[/] <-> [green]{target}[/] ({prune_label}, Batch: {chunk_size:,})",
+        title="ConduitDB Differential Sync",
+    ))
+
+    with TunnelManager.open_tunnel(src_cfg) as (s_host, s_port):
+        with TunnelManager.open_tunnel(dst_cfg) as (t_host, t_port):
+            src_conn = get_db_connection(src_cfg, s_host, s_port)
+            dst_conn = get_db_connection(dst_cfg, t_host, t_port)
+            try:
+                inspector = DatabaseInspector(src_conn, src_cfg.database)
+                synchronizer = DataSynchronizer(
+                    src_conn,
+                    dst_conn,
+                    chunk_size=chunk_size,
+                    prune=prune,
+                    dry_run=dry_run,
+                )
+
+                if tables:
+                    table_list = [t.strip() for t in tables.split(",") if t.strip()]
+                else:
+                    table_list = inspector.list_tables()
+                    table_list = inspector.sort_tables_topologically(table_list)
+
+                summary_stats: List[TableSyncStats] = []
+
+                for table_name in table_list:
+                    meta = inspector.get_table_metadata(table_name)
+                    exact_count = inspector.get_exact_row_count(table_name)
+
+                    console.print(f"\n[bold cyan]Syncing table:[/] {table_name} ({exact_count:,} rows in source)")
+
+                    # Smart Indexing: Pre-Sync Phase
+                    if auto_index and exact_count >= index_threshold and not dry_run:
+                        tgt_inspector = DatabaseInspector(dst_conn, dst_cfg.database)
+                        sec_indexes = tgt_inspector.get_secondary_indexes(table_name)
+                        if sec_indexes:
+                            console.print(f"  [yellow]⚡ Smart Indexing:[/] Dropping {len(sec_indexes)} secondary indexes during sync...")
+                            for s_idx in sec_indexes:
+                                try:
+                                    store.record_dropped_index(job_id, table_name, s_idx.name, s_idx.definition)
+                                    synchronizer.writer.drop_secondary_index(table_name, s_idx.name)
+                                except Exception as idx_err:
+                                    console.print(f"    [dim yellow]Warning: {idx_err}[/]")
+
+                    stats = synchronizer.sync_table(meta)
+                    summary_stats.append(stats)
+
+                    # Smart Indexing: Post-Sync Phase
+                    if auto_index and not dry_run:
+                        pending_indexes = store.get_dropped_indexes(job_id, table_name)
+                        if pending_indexes:
+                            console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes...")
+                            for p_idx in pending_indexes:
+                                try:
+                                    synchronizer.writer.recreate_secondary_index(table_name, p_idx["definition"])
+                                    store.mark_index_restored(job_id, table_name, p_idx["index_name"])
+                                except Exception as r_err:
+                                    console.print(f"    [red]✖ Failed to restore {p_idx['index_name']}: {r_err}[/]")
+
+                synchronizer.writer.restore_session()
+
+                # Print summary table
+                res_table = Table(title="ConduitDB Synchronization Summary", header_style="bold cyan")
+                res_table.add_column("Table", style="bold")
+                res_table.add_column("Inserted", justify="right", style="green")
+                res_table.add_column("Updated", justify="right", style="yellow")
+                res_table.add_column("Deleted", justify="right", style="red")
+                res_table.add_column("Unchanged", justify="right", style="dim")
+                res_table.add_column("Duration", justify="right", style="cyan")
+
+                for st in summary_stats:
+                    res_table.add_row(
+                        st.table_name,
+                        f"+{st.inserted:,}" if st.inserted else "0",
+                        f"~{st.updated:,}" if st.updated else "0",
+                        f"-{st.deleted:,}" if st.deleted else "0",
+                        f"{st.unchanged:,}",
+                        f"{st.time_taken_seconds:.2f}s",
+                    )
+                console.print(res_table)
+                console.print(f"[bold green]✔ Synchronization completed ({'DRY-RUN PREVIEW' if dry_run else 'APPLIED'})![/]")
+            finally:
+                src_conn.close()
+                dst_conn.close()
+
+
+@cli.group("indexes")
+def indexes_group() -> None:
+    """Manage dropped/pending secondary indexes from Smart Indexing."""
+    pass
+
+
+@indexes_group.command("list")
+@click.option("--state-db", default=".conduit_state.db", help="Path to SQLite checkpoint database.")
+def indexes_list_cmd(state_db: str) -> None:
+    """Lists all dropped and restored secondary indexes in checkpoint store."""
+    store = CheckpointStore(state_db)
+    all_indexes = store.list_all_indexes()
+    if not all_indexes:
+        console.print("[yellow]No index tracking records found in checkpoint store.[/]")
+        return
+
+    table = Table(title="Smart Indexing - Tracked Indexes", header_style="bold cyan")
+    table.add_column("Job ID", style="dim")
+    table.add_column("Table", style="bold")
+    table.add_column("Index Name", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Updated At", style="dim")
+
+    for idx in all_indexes:
+        st_style = "yellow" if idx["status"] == "DROPPED" else "green"
+        table.add_row(
+            idx["job_id"],
+            idx["table_name"],
+            idx["index_name"],
+            f"[{st_style}]{idx['status']}[/]",
+            idx["updated_at"],
+        )
+    console.print(table)
+
+
+@indexes_group.command("restore")
+@click.option("--target", "-t", required=True, help="Target profile name to restore indexes on.")
+@click.option("--table", default=None, help="Filter by specific table name.")
+@click.option("--state-db", default=".conduit_state.db", help="Path to SQLite checkpoint database.")
+@click.option("--config", "config_path", default=None, help="Path to profiles.yaml.")
+def indexes_restore_cmd(
+    target: str,
+    table: Optional[str],
+    state_db: str,
+    config_path: Optional[str],
+) -> None:
+    """Restores any pending DROPPED secondary indexes on target database."""
+    profiles = ConfigManager.load_profiles(config_path)
+    dst_cfg = profiles[target]
+    store = CheckpointStore(state_db)
+
+    pending = store.get_dropped_indexes("", table_name=table) if table else [
+        idx for idx in store.list_all_indexes() if idx["status"] == "DROPPED"
+    ]
+
+    if not pending:
+        console.print("[green]✔ No pending dropped indexes found to restore![/]")
+        return
+
+    console.print(Panel(
+        f"Restoring {len(pending)} dropped secondary indexes on target [green]{target}[/]",
+        title="ConduitDB Index Restoration",
+    ))
+
+    with TunnelManager.open_tunnel(dst_cfg) as (t_host, t_port):
+        dst_conn = get_db_connection(dst_cfg, t_host, t_port)
+        try:
+            writer = DataWriter(dst_conn)
+            for idx in pending:
+                t_name = idx["table_name"]
+                i_name = idx["index_name"]
+                definition = idx["definition"]
+                console.print(f"  Rebuilding index [cyan]{i_name}[/] on [bold]{t_name}[/]...")
+                try:
+                    writer.recreate_secondary_index(t_name, definition)
+                    store.mark_index_restored(idx["job_id"], t_name, i_name)
+                    console.print(f"    [green]✔ Successfully restored {i_name}[/]")
+                except Exception as e:
+                    console.print(f"    [bold red]✖ Failed to restore {i_name}: {e}[/]")
+            writer.restore_session()
+        finally:
+            dst_conn.close()
+
+
 def select_profile(prompt_text: str, profiles: dict[str, DatabaseConfig], default: Optional[str] = None) -> str:
     """Helper to select a database profile with interactive prompt."""
     names = list(profiles.keys())
@@ -511,13 +752,15 @@ def interactive_menu(config_path: Optional[str] = None) -> None:
             console.print("  [bold yellow]1[/]  🔍  [bold]Inspect database[/] (tables, columns, primary keys, and row counts)")
             console.print("  [bold yellow]2[/]  🔗  [bold]Test connectivity & SSH tunnels[/] (Source <-> Target)")
             console.print("  [bold yellow]3[/]  📐  [bold]Synchronize structure (DDL)[/] (CREATE TABLE with deferred foreign keys)")
-            console.print("  [bold yellow]4[/]  🚀  [bold]Start data transfer[/] (Streaming with progress bars and checkpoints)")
+            console.print("  [bold yellow]4[/]  🚀  [bold]Start data transfer[/] (Streaming with progress bars and Smart Indexing)")
             console.print("  [bold yellow]5[/]  ⏯️   [bold]Resume interrupted migration[/] (Resume from last saved cursor)")
-            console.print("  [bold yellow]6[/]  ✅  [bold]Audit & verify integrity[/] (Row count & CRC32 row checksums)")
-            console.print("  [bold yellow]7[/]  🧹  [bold]Reset migration checkpoints[/] (Clear saved state)")
+            console.print("  [bold yellow]6[/]  🔄  [bold]Differential sync[/] (Diff with windowed CRC32: INSERT, UPDATE, prune DELETE)")
+            console.print("  [bold yellow]7[/]  ✅  [bold]Audit & verify integrity[/] (Row count & CRC32 row checksums)")
+            console.print("  [bold yellow]8[/]  ⚡  [bold]Smart Indexing management[/] (List or restore dropped secondary indexes)")
+            console.print("  [bold yellow]9[/]  🧹  [bold]Reset migration checkpoints[/] (Clear saved state)")
             console.print("  [bold yellow]0[/]  🚪  [bold]Exit[/]")
 
-            choice = Prompt.ask("\n[bold]Select an operation[/]", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
+            choice = Prompt.ask("\n[bold]Select an operation[/]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], default="1")
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Operation cancelled by user.[/]")
             break
@@ -553,6 +796,7 @@ def interactive_menu(config_path: Optional[str] = None) -> None:
                 selected_tables = t_input if t_input else None
                 trunc = Confirm.ask("Truncate target tables before transfer?", default=False)
                 ups = Confirm.ask("Use UPSERT mode (ON DUPLICATE KEY UPDATE)?", default=False)
+                auto_idx = Confirm.ask("Enable Smart Indexing (temporarily drop secondary indexes for big tables)?", default=True)
 
                 transfer_cmd.callback(
                     source=src,
@@ -561,6 +805,8 @@ def interactive_menu(config_path: Optional[str] = None) -> None:
                     chunk_size=chunk_sz,
                     truncate=trunc,
                     upsert=ups,
+                    auto_index=auto_idx,
+                    index_threshold=100000,
                     state_db=".conduit_state.db",
                     config_path=config_path,
                 )
@@ -570,11 +816,35 @@ def interactive_menu(config_path: Optional[str] = None) -> None:
                     source=None,
                     target=None,
                     chunk_size=5000,
+                    auto_index=True,
+                    index_threshold=100000,
                     state_db=".conduit_state.db",
                     config_path=config_path,
                 )
 
             elif choice == "6":
+                src = select_profile("Select Source profile", profiles, default=profile_names[0])
+                dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
+                dst = select_profile("Select Target profile", profiles, default=dst_default)
+                t_input = Prompt.ask("Specific tables (comma-separated, or Enter for all)", default="").strip()
+                selected_tables = t_input if t_input else None
+                chunk_sz = IntPrompt.ask("Window chunk size for checksum", default=5000)
+                is_dry = Confirm.ask("Run in Preview mode without applying changes (--dry-run)?", default=False)
+                do_prune = Confirm.ask("Delete rows from target missing from source (--prune)?", default=False)
+
+                sync_cmd.callback(
+                    source=src,
+                    target=dst,
+                    tables=selected_tables,
+                    chunk_size=chunk_sz,
+                    prune=do_prune,
+                    dry_run=is_dry,
+                    auto_index=True,
+                    index_threshold=100000,
+                    config_path=config_path,
+                )
+
+            elif choice == "7":
                 src = select_profile("Select Source profile", profiles, default=profile_names[0])
                 dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
                 dst = select_profile("Select Target profile", profiles, default=dst_default)
@@ -589,7 +859,15 @@ def interactive_menu(config_path: Optional[str] = None) -> None:
                     config_path=config_path,
                 )
 
-            elif choice == "7":
+            elif choice == "8":
+                act = Prompt.ask("Smart Indexing action", choices=["list", "restore"], default="list")
+                if act == "list":
+                    indexes_list_cmd.callback(state_db=".conduit_state.db")
+                else:
+                    dst = select_profile("Select Target profile to restore indexes on", profiles)
+                    indexes_restore_cmd.callback(target=dst, table=None, state_db=".conduit_state.db", config_path=config_path)
+
+            elif choice == "9":
                 src = select_profile("Select Source profile", profiles, default=profile_names[0])
                 dst_default = profile_names[1] if len(profile_names) > 1 else profile_names[0]
                 dst = select_profile("Select Target profile", profiles, default=dst_default)

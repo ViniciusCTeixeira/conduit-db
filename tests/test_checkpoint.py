@@ -24,3 +24,25 @@ def test_checkpoint_lifecycle(tmp_path: Path):
     completed = store.get_table_checkpoint(job_id, "users")
     assert completed is not None
     assert completed.status == "COMPLETED"
+
+
+def test_checkpoint_index_tracking(tmp_path: Path):
+    db_file = tmp_path / "state.db"
+    store = CheckpointStore(db_file)
+    job_id = store.get_or_create_job("src_prod", "dst_local")
+
+    # Record dropped index
+    store.record_dropped_index(job_id, "rfb_empresas", "idx_rfb_emp_razao", "KEY `idx_rfb_emp_razao` (`razao_social`)")
+    dropped = store.get_dropped_indexes(job_id, "rfb_empresas")
+    assert len(dropped) == 1
+    assert dropped[0]["index_name"] == "idx_rfb_emp_razao"
+    assert dropped[0]["status"] == "DROPPED"
+
+    # Mark restored
+    store.mark_index_restored(job_id, "rfb_empresas", "idx_rfb_emp_razao")
+    pending = store.get_dropped_indexes(job_id, "rfb_empresas")
+    assert len(pending) == 0
+
+    all_tracked = store.list_all_indexes(job_id)
+    assert len(all_tracked) == 1
+    assert all_tracked[0]["status"] == "RESTORED"

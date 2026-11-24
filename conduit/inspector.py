@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 import pymysql
 
 from conduit.config import DatabaseConfig
+
+
+@dataclass
+class IndexInfo:
+    name: str
+    table_name: str
+    columns: List[str] = field(default_factory=list)
+    is_unique: bool = False
+    index_type: str = "BTREE"
+    definition: str = ""
 
 
 @dataclass
@@ -139,6 +150,48 @@ class DatabaseInspector:
             cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
             row = cursor.fetchone()
             return int(row[0]) if row else 0
+
+    def get_secondary_indexes(self, table_name: str) -> List[IndexInfo]:
+        """
+        Parses SHOW CREATE TABLE to identify all non-primary secondary indexes
+        and their exact DDL definitions (including sub-parts, types, uniqueness).
+        """
+        indexes: List[IndexInfo] = []
+        with self.conn.cursor() as cursor:
+            try:
+                cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
+                row = cursor.fetchone()
+                if not row or len(row) < 2:
+                    return []
+                ddl = row[1]
+            except Exception:
+                return []
+
+        index_pattern = re.compile(
+            r"^\s*(UNIQUE\s+KEY|KEY|INDEX|FULLTEXT\s+KEY|SPATIAL\s+KEY)\s+`([^`]+)`\s+\((.+?)\)(.*)$",
+            re.IGNORECASE,
+        )
+
+        for line in ddl.split("\n"):
+            line = line.strip().rstrip(",")
+            match = index_pattern.match(line)
+            if match:
+                idx_type_str, idx_name, cols_str, extra = match.groups()
+                if idx_name.upper() == "PRIMARY":
+                    continue
+                is_unique = "UNIQUE" in idx_type_str.upper()
+                cols = [c.strip(" `").split("(")[0].strip() for c in cols_str.split(",")]
+                indexes.append(
+                    IndexInfo(
+                        name=idx_name,
+                        table_name=table_name,
+                        columns=cols,
+                        is_unique=is_unique,
+                        definition=line,
+                    )
+                )
+
+        return indexes
 
     def sort_tables_topologically(self, tables: List[str]) -> List[str]:
         """Orders tables so referenced parent tables are migrated before child tables."""

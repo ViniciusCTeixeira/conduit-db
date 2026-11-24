@@ -14,6 +14,8 @@ Unlike conventional desktop GUI tools (such as Navicat or DBeaver) that run naiv
 - **Topological Schema Sync**: Analyzes `information_schema.KEY_COLUMN_USAGE` to determine table dependencies, drops/strips foreign keys during the initial table creation, and applies deferred constraints after data loads.
 - **Built-in SSH Tunnels**: Transparently opens encrypted SSH tunnels (using keys, passphrases, or passwords) to remote database servers without requiring external tooling.
 - **Deterministic Verification**: Validates migration accuracy using row count comparisons and server-side checksum hashing (`BIT_XOR(CRC32(...))`).
+- **Smart Indexing (Bulk Index Acceleration)**: Detects tables exceeding configurable thresholds (e.g. 100k rows) and temporarily drops secondary indexes on the target before streaming. Rebuilds them post-migration in parallel using MySQL 8 Bulk Index Creation (eliminating random I/O stalls).
+- **Differential Synchronization Engine (`conduit sync`)**: Two-way block-level checksum comparison (Merkle/windowed CRC32). Rapidly skips identical chunks (zero bandwidth, zero disk writes) and applies targeted `INSERT`, `UPDATE`, and optional `DELETE` (`--prune`) with `--dry-run` preview mode.
 
 ---
 
@@ -129,7 +131,32 @@ If a network failure or manual interruption occurs, inspect and resume pending t
 conduit resume -s production_source -t analytics_target
 ```
 
-### 6. Verify Data Integrity
+### 6. Differential Synchronization (conduit sync)
+Synchronize tables using windowed CRC32 checksums without re-transferring identical data:
+
+```bash
+# Preview changes without modifying target (--dry-run)
+conduit sync -s production_source -t analytics_target --dry-run
+
+# Synchronize tables, adding new rows and updating modified rows
+conduit sync -s production_source -t analytics_target --tables rfb_empresas,rfb_estabelecimentos
+
+# Strict 1:1 synchronization with orphan deletion (--prune)
+conduit sync -s production_source -t analytics_target --prune
+```
+
+### 7. Smart Indexing Management (conduit indexes)
+Inspect and manage secondary indexes dropped during high-throughput bulk loads:
+
+```bash
+# List all tracked indexes and their status (DROPPED / RESTORED)
+conduit indexes list
+
+# Rebuild and restore dropped secondary indexes on target
+conduit indexes restore -t analytics_target
+```
+
+### 8. Verify Data Integrity
 Compare row counts and run server-side cryptographic checksums to ensure 1:1 parity:
 
 ```bash
@@ -140,7 +167,7 @@ conduit verify -s production_source -t analytics_target
 conduit verify -s production_source -t analytics_target --hash
 ```
 
-### 7. Reset Migration State
+### 9. Reset Migration State
 Clear the checkpoint tracking database when you wish to start a fresh migration:
 
 ```bash

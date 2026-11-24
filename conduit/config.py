@@ -89,11 +89,12 @@ class ConfigManager:
         paths_to_check = []
         if config_path:
             paths_to_check.append(Path(config_path))
-        paths_to_check.extend([
-            Path("profiles.yaml"),
-            Path("profiles.yml"),
-            Path.home() / ".conduit" / "profiles.yaml",
-        ])
+        else:
+            paths_to_check.extend([
+                Path("profiles.yaml"),
+                Path("profiles.yml"),
+                Path.home() / ".conduit" / "profiles.yaml",
+            ])
 
         found_path: Optional[Path] = None
         for p in paths_to_check:

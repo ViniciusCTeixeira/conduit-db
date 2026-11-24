@@ -61,6 +61,19 @@ class CheckpointStore:
                     FOREIGN KEY (job_id) REFERENCES conduit_jobs(job_id) ON DELETE CASCADE
                 );
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conduit_indexes (
+                    job_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    index_name TEXT NOT NULL,
+                    definition TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (job_id, table_name, index_name),
+                    FOREIGN KEY (job_id) REFERENCES conduit_jobs(job_id) ON DELETE CASCADE
+                );
+            """)
             conn.commit()
 
     @staticmethod
@@ -213,6 +226,63 @@ class CheckpointStore:
 
     def reset_job(self, job_id: str) -> None:
         with self._get_connection() as conn:
+            conn.execute("DELETE FROM conduit_indexes WHERE job_id = ?", (job_id,))
             conn.execute("DELETE FROM conduit_tables WHERE job_id = ?", (job_id,))
             conn.execute("DELETE FROM conduit_jobs WHERE job_id = ?", (job_id,))
             conn.commit()
+
+    def record_dropped_index(self, job_id: str, table_name: str, index_name: str, definition: str) -> None:
+        now = self._now()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO conduit_indexes (job_id, table_name, index_name, definition, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'DROPPED', ?, ?)
+                ON CONFLICT(job_id, table_name, index_name) DO UPDATE SET
+                    definition = excluded.definition,
+                    status = 'DROPPED',
+                    updated_at = excluded.updated_at
+                """,
+                (job_id, table_name, index_name, definition, now, now),
+            )
+            conn.commit()
+
+    def mark_index_restored(self, job_id: str, table_name: str, index_name: str) -> None:
+        now = self._now()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE conduit_indexes
+                SET status = 'RESTORED', updated_at = ?
+                WHERE job_id = ? AND table_name = ? AND index_name = ?
+                """,
+                (now, job_id, table_name, index_name),
+            )
+            conn.commit()
+
+    def get_dropped_indexes(self, job_id: str, table_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            if table_name:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes WHERE job_id = ? AND table_name = ? AND status = 'DROPPED'",
+                    (job_id, table_name),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes WHERE job_id = ? AND status = 'DROPPED'",
+                    (job_id,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_all_indexes(self, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            if job_id:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes WHERE job_id = ? ORDER BY table_name, index_name",
+                    (job_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes ORDER BY job_id, table_name, index_name"
+                ).fetchall()
+            return [dict(r) for r in rows]

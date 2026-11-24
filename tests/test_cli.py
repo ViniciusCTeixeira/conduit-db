@@ -7,7 +7,7 @@ def test_cli_version():
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
     assert "conduit-db" in result.output
-    assert "1.0.0" in result.output
+    assert "1.1.0" in result.output
 
 
 def test_cli_help():
@@ -15,11 +15,30 @@ def test_cli_help():
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "transfer" in result.output
+    assert "sync" in result.output
+    assert "indexes" in result.output
     assert "inspect" in result.output
     assert "schema" in result.output
     assert "resume" in result.output
     assert "verify" in result.output
     assert "menu" in result.output
+
+
+def test_cli_indexes_help():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["indexes", "--help"])
+    assert result.exit_code == 0
+    assert "list" in result.output
+    assert "restore" in result.output
+
+
+def test_cli_sync_help():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["sync", "--help"])
+    assert result.exit_code == 0
+    assert "--prune" in result.output
+    assert "--dry-run" in result.output
+    assert "--auto-index" in result.output
 
 
 def test_cli_interactive_menu_exit(tmp_path):

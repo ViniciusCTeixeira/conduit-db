@@ -58,3 +58,32 @@ class DataWriter:
             cursor.execute(f"TRUNCATE TABLE `{table_name}`")
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
         self.conn.commit()
+
+    def drop_secondary_index(self, table_name: str, index_name: str) -> bool:
+        """Drops a secondary index to maximize bulk insert throughput."""
+        with self.conn.cursor() as cursor:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cursor.execute(f"ALTER TABLE `{table_name}` DROP INDEX `{index_name}`")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        self.conn.commit()
+        return True
+
+    def recreate_secondary_index(self, table_name: str, definition: str) -> bool:
+        """Recreates a secondary index using its original DDL clause."""
+        with self.conn.cursor() as cursor:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cursor.execute(f"ALTER TABLE `{table_name}` ADD {definition}")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        self.conn.commit()
+        return True
+
+    def batch_delete(self, table_name: str, pk_column: str, pk_values: Sequence[Any]) -> int:
+        """Deletes a batch of rows by Primary Key."""
+        if not pk_values:
+            return 0
+        placeholders = ", ".join(["%s"] * len(pk_values))
+        sql = f"DELETE FROM `{table_name}` WHERE `{pk_column}` IN ({placeholders})"
+        with self.conn.cursor() as cursor:
+            cursor.execute(sql, tuple(pk_values))
+        self.conn.commit()
+        return len(pk_values)
