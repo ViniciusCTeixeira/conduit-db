@@ -52,3 +52,23 @@ def test_checkpoint_index_tracking(tmp_path: Path):
     global_dropped = store.get_dropped_indexes(table_name="rfb_empresas")
     assert len(global_dropped) == 1
     assert global_dropped[0]["index_name"] == "idx_rfb_emp_porte"
+
+
+def test_composite_checkpoint_cursor(tmp_path: Path):
+    import json
+    db_file = tmp_path / "state.db"
+    store = CheckpointStore(db_file)
+    job_id = store.get_or_create_job("src_prod", "dst_local")
+
+    cp = store.init_table(job_id, "rfb_estabelecimentos", "cnpj_basico,cnpj_ordem,cnpj_dv", "composite", total_rows=1000)
+    assert cp.pk_column == "cnpj_basico,cnpj_ordem,cnpj_dv"
+    assert cp.pk_type == "composite"
+
+    # Store composite cursor as tuple
+    composite_cursor = ("00000000", "0001", "91")
+    store.update_cursor(job_id, "rfb_estabelecimentos", last_cursor_value=composite_cursor, newly_migrated_count=100)
+
+    updated = store.get_table_checkpoint(job_id, "rfb_estabelecimentos")
+    assert updated is not None
+    assert updated.migrated_rows == 100
+    assert updated.last_cursor_value == json.dumps(list(composite_cursor))

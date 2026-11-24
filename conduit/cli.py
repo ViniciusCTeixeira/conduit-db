@@ -322,6 +322,8 @@ def transfer_cmd(
                         c_migrated = cp_existing.migrated_rows
                         if cp_existing.status == "COMPLETED" and not truncate:
                             completed_tables += 1
+                        elif (cp_existing.last_cursor_value is None or c_migrated > c_count) and not truncate:
+                            c_migrated = 0
                     else:
                         meta_t = inspector.get_table_metadata(t_name)
                         table_metas[t_name] = meta_t
@@ -373,7 +375,7 @@ def transfer_cmd(
                         cp = store.init_table(
                             job_id=job_id,
                             table_name=table_name,
-                            pk_column=meta.primary_key,
+                            pk_column=meta.pk_columns_str,
                             pk_type=meta.pk_type,
                             total_rows=exact_count,
                         )
@@ -408,6 +410,19 @@ def transfer_cmd(
                                 progress.update(overall_task, completed=grand_migrated_rows)
                             cp.last_cursor_value = None
                             cp.migrated_rows = 0
+                        elif cp.status != "COMPLETED" and (cp.last_cursor_value is None or cp.migrated_rows > exact_count):
+                            if cp.migrated_rows > 0:
+                                with store._get_connection() as conn:
+                                    conn.execute(
+                                        "UPDATE conduit_tables SET migrated_rows = 0, last_cursor_value = NULL WHERE job_id = ? AND table_name = ?",
+                                        (job_id, table_name),
+                                    )
+                                    conn.commit()
+                                if overall_task is not None:
+                                    grand_migrated_rows = max(0, grand_migrated_rows - cp.migrated_rows)
+                                    progress.update(overall_task, completed=grand_migrated_rows)
+                                cp.migrated_rows = 0
+                                cp.last_cursor_value = None
 
                         # Smart Indexing: Pre-Stream Phase
                         if auto_index and exact_count >= index_threshold:
@@ -469,6 +484,8 @@ def transfer_cmd(
                             progress.update(task_id, operation="✔ Done")
                             if overall_task is not None:
                                 progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tables")
+                        except KeyboardInterrupt:
+                            raise
                         except Exception as e:
                             store.mark_failed(job_id, table_name, str(e))
                             console.print(f"[bold red]Failed on table {table_name}: {e}[/]")
@@ -476,9 +493,22 @@ def transfer_cmd(
 
                 writer.restore_session()
                 console.print("[bold green]✔ Transfer completed successfully![/]")
+            except KeyboardInterrupt:
+                console.print("\n[bold yellow]⚠ Transfer aborted by user (Ctrl+C). Progress and checkpoints preserved.[/]")
+                try:
+                    writer.restore_session()
+                except Exception:
+                    pass
+                return
             finally:
-                src_conn.close()
-                dst_conn.close()
+                try:
+                    src_conn.close()
+                except Exception:
+                    pass
+                try:
+                    dst_conn.close()
+                except Exception:
+                    pass
 
 
 @cli.command("resume")

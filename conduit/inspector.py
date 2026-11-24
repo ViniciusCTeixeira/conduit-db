@@ -32,12 +32,23 @@ class ColumnInfo:
 @dataclass
 class TableMeta:
     name: str
-    primary_key: Optional[str]  # Single PK column name if simple PK
+    primary_key: Optional[str] = None  # Single PK column name if simple PK
     composite_pks: List[str] = field(default_factory=list)
     pk_type: Optional[str] = None
     columns: List[ColumnInfo] = field(default_factory=list)
     estimated_rows: int = 0
     depends_on: Set[str] = field(default_factory=set)
+
+    @property
+    def primary_keys(self) -> List[str]:
+        if self.primary_key:
+            return [self.primary_key]
+        return self.composite_pks
+
+    @property
+    def pk_columns_str(self) -> Optional[str]:
+        pks = self.primary_keys
+        return ",".join(pks) if pks else None
 
 
 class DatabaseInspector:
@@ -109,6 +120,8 @@ class DatabaseInspector:
                     if col.name == single_pk:
                         pk_type = col.data_type
                         break
+            elif len(pks) > 1:
+                pk_type = "composite"
 
             # 3. Foreign key dependencies
             cursor.execute(

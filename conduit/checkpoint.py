@@ -109,10 +109,16 @@ class CheckpointStore:
             ).fetchone()
 
             if row:
+                if (row["pk_column"] is None and pk_column is not None) or (row["pk_type"] is None and pk_type is not None):
+                    conn.execute(
+                        "UPDATE conduit_tables SET pk_column = ?, pk_type = ? WHERE job_id = ? AND table_name = ?",
+                        (pk_column, pk_type, job_id, table_name),
+                    )
+                    conn.commit()
                 return TableCheckpoint(
                     table_name=row["table_name"],
-                    pk_column=row["pk_column"],
-                    pk_type=row["pk_type"],
+                    pk_column=pk_column or row["pk_column"],
+                    pk_type=pk_type or row["pk_type"],
                     total_rows=row["total_rows"],
                     migrated_rows=row["migrated_rows"],
                     last_cursor_value=row["last_cursor_value"],
@@ -148,7 +154,14 @@ class CheckpointStore:
         newly_migrated_count: int,
     ) -> None:
         now = self._now()
-        str_cursor = str(last_cursor_value) if last_cursor_value is not None else None
+        if last_cursor_value is not None:
+            if isinstance(last_cursor_value, (list, tuple)):
+                import json
+                str_cursor = json.dumps(list(last_cursor_value))
+            else:
+                str_cursor = str(last_cursor_value)
+        else:
+            str_cursor = None
         with self._get_connection() as conn:
             conn.execute(
                 """UPDATE conduit_tables 
