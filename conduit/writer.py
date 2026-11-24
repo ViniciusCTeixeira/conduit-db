@@ -16,6 +16,7 @@ def configure_socket_keepalive(conn: Any) -> None:
     try:
         sock = getattr(conn, "_sock", None)
         if sock is not None and hasattr(sock, "setsockopt"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             if hasattr(socket, "TCP_KEEPIDLE"):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
@@ -32,8 +33,9 @@ def configure_socket_keepalive(conn: Any) -> None:
 class DataWriter:
     """High-performance batch writer for MySQL/MariaDB with disabled safety locks during migration."""
 
-    def __init__(self, conn: pymysql.Connection):
+    def __init__(self, conn: pymysql.Connection, max_stmt_length: int = 16 * 1024 * 1024):
         self.conn = conn
+        self.max_stmt_length = max_stmt_length
         configure_socket_keepalive(self.conn)
         self._init_session()
 
@@ -84,6 +86,7 @@ class DataWriter:
             sql = f"INSERT INTO `{table_name}` ({escaped_cols}) VALUES ({placeholders})"
 
         with self.conn.cursor() as cursor:
+            cursor.max_stmt_length = self.max_stmt_length
             cursor.executemany(sql, rows)
 
         self.conn.commit()

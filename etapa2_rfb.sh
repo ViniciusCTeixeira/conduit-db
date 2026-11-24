@@ -15,4 +15,4 @@ python conduit.py transfer \
   --target production \
   --tables "$TABLES" \
   --upsert \
-  --chunk-size 10000 "$@"
+  --chunk-size 20000 "$@"
