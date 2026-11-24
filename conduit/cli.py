@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import click
 import pymysql
 from rich.console import Console
@@ -41,7 +41,7 @@ class TableNameColumn(ProgressColumn):
 
     def render(self, task) -> Text:
         tname = task.fields.get("table", task.description)
-        is_total = task.fields.get("unit") == "tables"
+        is_total = task.fields.get("is_total", False) or tname == "[Total Progress]"
         style = "bold magenta" if is_total else "bold cyan"
         return Text(f"{tname:<22}", style=style)
 
@@ -51,7 +51,9 @@ class ProgressCounterColumn(ProgressColumn):
 
     def render(self, task) -> Text:
         unit = task.fields.get("unit", "rows")
-        return Text(f"{task.completed:,}/{task.total:,} {unit}", style="white")
+        completed = int(task.completed or 0)
+        total = int(task.total or 0)
+        return Text(f"{completed:,}/{total:,} {unit}", style="white")
 
 
 class RowsSpeedColumn(ProgressColumn):
@@ -63,6 +65,18 @@ class RowsSpeedColumn(ProgressColumn):
         if task.speed is None:
             return Text("-- rows/s", style="dim yellow")
         return Text(f"{task.speed:,.0f} rows/s", style="bold yellow")
+
+
+class OperationColumn(ProgressColumn):
+    """Renders current phase, operation or table counter."""
+
+    def render(self, task) -> Text:
+        op = task.fields.get("operation", "")
+        if not op:
+            return Text("")
+        is_total = task.fields.get("is_total", False) or task.fields.get("table") == "[Total Progress]"
+        style = "bold cyan" if is_total else "dim cyan"
+        return Text(f"[{op}]", style=style)
 
 
 def get_db_connection(cfg: DatabaseConfig, host_override: str, port_override: int) -> pymysql.Connection:
@@ -294,8 +308,34 @@ def transfer_cmd(
                     table_list = inspector.list_tables()
                     table_list = inspector.sort_tables_topologically(table_list)
 
+                # Pre-inspect row counts to provide accurate global row-level progress
+                table_counts: Dict[str, int] = {}
+                table_metas: Dict[str, Any] = {}
+                grand_total_rows = 0
+                grand_migrated_rows = 0
+                completed_tables = 0
+
+                for t_name in table_list:
+                    cp_existing = store.get_table_checkpoint(job_id, t_name)
+                    if cp_existing is not None and cp_existing.total_rows > 0:
+                        c_count = cp_existing.total_rows
+                        c_migrated = cp_existing.migrated_rows
+                        if cp_existing.status == "COMPLETED" and not truncate:
+                            completed_tables += 1
+                    else:
+                        meta_t = inspector.get_table_metadata(t_name)
+                        table_metas[t_name] = meta_t
+                        c_count = inspector.get_exact_row_count(t_name)
+                        c_migrated = 0
+                    table_counts[t_name] = c_count
+                    grand_total_rows += c_count
+                    grand_migrated_rows += c_migrated
+
+                num_tables = len(table_list)
+                display_grand_total = max(1, grand_total_rows) if grand_total_rows == 0 else grand_total_rows
+
                 console.print(Panel(
-                    f"Transferring {len(table_list)} tables: [cyan]{source}[/] -> [green]{target}[/] (Batch: {chunk_size:,})",
+                    f"Transferring {num_tables} tables: [cyan]{source}[/] -> [green]{target}[/] (Batch: {chunk_size:,}) | Total Dataset: [bold yellow]{grand_total_rows:,}[/] rows",
                     title="ConduitDB Transfer",
                 ))
 
@@ -308,21 +348,27 @@ def transfer_cmd(
                     RowsSpeedColumn(),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
+                    OperationColumn(),
                     console=console,
                 )
 
                 with progress:
                     overall_task = progress.add_task(
                         "Total Progress",
-                        total=len(table_list),
-                        completed=0,
+                        total=display_grand_total,
+                        completed=grand_migrated_rows,
                         table="[Total Progress]",
-                        unit="tables",
-                    ) if len(table_list) > 1 else None
+                        unit="rows",
+                        is_total=True,
+                        operation=f"{completed_tables}/{num_tables} tables",
+                    ) if num_tables > 1 else None
 
                     for table_name in table_list:
-                        meta = inspector.get_table_metadata(table_name)
-                        exact_count = inspector.get_exact_row_count(table_name)
+                        meta = table_metas.get(table_name) or inspector.get_table_metadata(table_name)
+                        exact_count = table_counts.get(table_name)
+                        if exact_count is None:
+                            exact_count = inspector.get_exact_row_count(table_name)
+                            table_counts[table_name] = exact_count
 
                         cp = store.init_table(
                             job_id=job_id,
@@ -337,6 +383,8 @@ def transfer_cmd(
                             # Restore any secondary indexes that might still be pending
                             pending_indexes = store.get_dropped_indexes(job_id, table_name)
                             if pending_indexes:
+                                if overall_task is not None:
+                                    progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tbls | 🔨 Rebuilding Indexes")
                                 console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} pending secondary indexes on [green]{table_name}[/] (single-pass batch)...")
                                 wait_for_active_alter_table(dst_conn, table_name)
                                 definitions = [p["definition"] for p in pending_indexes]
@@ -349,12 +397,15 @@ def transfer_cmd(
                                     console.print(f"    [bold red]✖ Failed to restore indexes on {table_name}: {r_err}[/]")
                                     raise
                             if overall_task is not None:
-                                progress.advance(overall_task, 1)
+                                progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tables")
                             continue
 
                         if truncate:
                             writer.truncate_table(table_name)
                             store.reset_job(job_id)
+                            if cp.migrated_rows > 0 and overall_task is not None:
+                                grand_migrated_rows = max(0, grand_migrated_rows - cp.migrated_rows)
+                                progress.update(overall_task, completed=grand_migrated_rows)
                             cp.last_cursor_value = None
                             cp.migrated_rows = 0
 
@@ -363,6 +414,8 @@ def transfer_cmd(
                             tgt_inspector = DatabaseInspector(dst_conn, dst_cfg.database)
                             sec_indexes = tgt_inspector.get_secondary_indexes(table_name)
                             if sec_indexes:
+                                if overall_task is not None:
+                                    progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tbls | ⚡ Dropping Indexes")
                                 console.print(f"  [yellow]⚡ Smart Indexing:[/] Temporarily dropping {len(sec_indexes)} secondary indexes on [green]{table_name}[/] to maximize bulk write throughput...")
                                 for s_idx in sec_indexes:
                                     try:
@@ -372,12 +425,16 @@ def transfer_cmd(
                                     except Exception as idx_err:
                                         console.print(f"    [dim yellow]Warning: Could not drop index {s_idx.name}: {idx_err}[/]")
 
+                        if overall_task is not None:
+                            progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tbls | Streaming")
+
                         task_id = progress.add_task(
                             "Transferring",
                             total=exact_count,
                             completed=cp.migrated_rows,
                             table=table_name,
                             unit="rows",
+                            operation="Streaming",
                         )
 
                         try:
@@ -386,10 +443,15 @@ def transfer_cmd(
                                 writer.write_batch(table_name, col_names, rows_chunk, upsert=upsert)
                                 store.update_cursor(job_id, table_name, last_pk, len(rows_chunk))
                                 progress.advance(task_id, len(rows_chunk))
+                                if overall_task is not None:
+                                    progress.advance(overall_task, len(rows_chunk))
 
                             # Smart Indexing: Post-Stream Phase
                             pending_indexes = store.get_dropped_indexes(job_id, table_name)
                             if pending_indexes:
+                                if overall_task is not None:
+                                    progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tbls | 🔨 Rebuilding Indexes")
+                                progress.update(task_id, operation="🔨 Rebuilding Indexes")
                                 console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes on [green]{table_name}[/] (single-pass batch)...")
                                 wait_for_active_alter_table(dst_conn, table_name)
                                 definitions = [p["definition"] for p in pending_indexes]
@@ -403,8 +465,10 @@ def transfer_cmd(
                                     raise
 
                             store.mark_completed(job_id, table_name)
+                            completed_tables += 1
+                            progress.update(task_id, operation="✔ Done")
                             if overall_task is not None:
-                                progress.advance(overall_task, 1)
+                                progress.update(overall_task, operation=f"{completed_tables}/{num_tables} tables")
                         except Exception as e:
                             store.mark_failed(job_id, table_name, str(e))
                             console.print(f"[bold red]Failed on table {table_name}: {e}[/]")

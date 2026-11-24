@@ -65,3 +65,26 @@ def test_cli_interactive_menu_missing_config(tmp_path):
     result = runner.invoke(cli, ["--config", str(tmp_path / "nonexistent.yaml")])
     assert result.exit_code == 0
     assert "No database profiles found" in result.output
+
+
+def test_progress_columns():
+    from unittest.mock import MagicMock
+    from conduit.cli import OperationColumn, ProgressCounterColumn, RowsSpeedColumn, TableNameColumn
+
+    mock_task = MagicMock()
+    mock_task.description = "Transferring"
+    mock_task.fields = {"table": "[Total Progress]", "is_total": True, "operation": "1/3 tables", "unit": "rows"}
+    mock_task.completed = 70517432
+    mock_task.total = 144326811
+    mock_task.speed = 13500.0
+
+    table_col = TableNameColumn()
+    counter_col = ProgressCounterColumn()
+    speed_col = RowsSpeedColumn()
+    op_col = OperationColumn()
+
+    assert "[Total Progress]" in table_col.render(mock_task).plain
+    assert "70,517,432/144,326,811 rows" in counter_col.render(mock_task).plain
+    assert "13,500 rows/s" in speed_col.render(mock_task).plain
+    assert "[1/3 tables]" in op_col.render(mock_task).plain
+
