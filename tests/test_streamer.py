@@ -61,8 +61,18 @@ def test_composite_keyset_streaming():
     assert chunks[1][0] == batch2
     assert chunks[1][2] == ("00000001", "0001", "12")
 
-    # Verify query for 2nd batch includes composite row constructor comparison
+    # Verify query for 2nd batch uses expanded lexicographical range comparison (MySQL index range scan)
     called_queries = [call_args[0][0] for call_args in mock_cursor.execute.call_args_list]
+    called_params = [call_args[0][1] for call_args in mock_cursor.execute.call_args_list]
     assert len(called_queries) == 2
-    assert "WHERE (`cnpj_basico`, `cnpj_ordem`, `cnpj_dv`) > (%s, %s, %s)" in called_queries[1]
+    assert (
+        "WHERE (`cnpj_basico` > %s) "
+        "OR (`cnpj_basico` = %s AND `cnpj_ordem` > %s) "
+        "OR (`cnpj_basico` = %s AND `cnpj_ordem` = %s AND `cnpj_dv` > %s)"
+    ) in called_queries[1]
+    assert called_params[1] == [
+        "00000000",
+        "00000000", "0002",
+        "00000000", "0002", "72",
+    ]
     assert "ORDER BY `cnpj_basico` ASC, `cnpj_ordem` ASC, `cnpj_dv` ASC" in called_queries[1]

@@ -92,9 +92,15 @@ class DataStreamer:
         import json
 
         pk_indices = [col_names.index(pk) for pk in pks]
-        escaped_pks = ", ".join(f"`{pk}`" for pk in pks)
         order_clause = ", ".join(f"`{pk}` ASC" for pk in pks)
-        placeholders = ", ".join(["%s"] * len(pks))
+
+        or_branches = []
+        for i in range(len(pks)):
+            eq_parts = [f"`{pks[j]}` = %s" for j in range(i)]
+            gt_part = f"`{pks[i]}` > %s"
+            branch = " AND ".join(eq_parts + [gt_part])
+            or_branches.append(f"({branch})")
+        where_clause = " OR ".join(or_branches)
 
         current_cursor: Optional[Tuple[Any, ...]] = None
         if resume_cursor is not None:
@@ -112,11 +118,12 @@ class DataStreamer:
             if current_cursor is not None:
                 query = (
                     f"SELECT {escaped_cols} FROM `{table_name}` "
-                    f"WHERE ({escaped_pks}) > ({placeholders}) "
+                    f"WHERE {where_clause} "
                     f"ORDER BY {order_clause} "
                     f"LIMIT {self.chunk_size}"
                 )
-                params.extend(current_cursor)
+                for i in range(len(pks)):
+                    params.extend(current_cursor[: i + 1])
             else:
                 query = (
                     f"SELECT {escaped_cols} FROM `{table_name}` "
