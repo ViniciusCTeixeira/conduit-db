@@ -66,6 +66,40 @@ def test_writer_idempotent_index_operations():
     assert writer.drop_secondary_index("test_tbl", "idx_test") is True
 
 
+def test_writer_recreate_indexes_batch():
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    writer = DataWriter(mock_conn)
+    defs = ["KEY `idx_1` (`col1`)", "KEY `idx_2` (`col2`)"]
+    writer.recreate_secondary_indexes_batch("rfb_estabelecimentos", defs)
+
+    mock_cursor.execute.assert_any_call("ALTER TABLE `rfb_estabelecimentos` ADD KEY `idx_1` (`col1`), ADD KEY `idx_2` (`col2`)")
+
+
+def test_writer_recreate_indexes_batch_fallback_on_duplicate():
+    import pymysql.err
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    writer = DataWriter(mock_conn)
+
+    def execute_side_effect(sql, *args):
+        if "ADD KEY `idx_1`" in sql and "ADD KEY `idx_2`" in sql:
+            # Multi-index fails because idx_1 already exists
+            raise pymysql.err.OperationalError(1061, "Duplicate key name 'idx_1'")
+        if "ADD KEY `idx_1`" in sql:
+            raise pymysql.err.OperationalError(1061, "Duplicate key name 'idx_1'")
+        return None
+
+    mock_cursor.execute.side_effect = execute_side_effect
+    defs = ["KEY `idx_1` (`col1`)", "KEY `idx_2` (`col2`)"]
+    assert writer.recreate_secondary_indexes_batch("rfb_estabelecimentos", defs) is True
+
+
 def test_writer_batch_delete():
     mock_conn = MagicMock()
     mock_cursor = MagicMock()

@@ -30,7 +30,7 @@ from conduit.streamer import DataStreamer
 from conduit.synchronizer import DataSynchronizer, TableSyncStats
 from conduit.tunnel import TunnelManager
 from conduit.verifier import DataVerifier
-from conduit.writer import DataWriter
+from conduit.writer import DataWriter, configure_socket_keepalive
 
 
 console = Console()
@@ -66,7 +66,7 @@ class RowsSpeedColumn(ProgressColumn):
 
 
 def get_db_connection(cfg: DatabaseConfig, host_override: str, port_override: int) -> pymysql.Connection:
-    return pymysql.connect(
+    conn = pymysql.connect(
         host=host_override,
         port=port_override,
         user=cfg.user,
@@ -78,6 +78,32 @@ def get_db_connection(cfg: DatabaseConfig, host_override: str, port_override: in
         write_timeout=cfg.write_timeout,
         autocommit=False,
     )
+    configure_socket_keepalive(conn)
+    return conn
+
+
+def wait_for_active_alter_table(conn: pymysql.Connection, table_name: str, check_interval: int = 5) -> None:
+    """If an ALTER TABLE query is already executing on the server, waits and polls until it finishes."""
+    while True:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SHOW PROCESSLIST")
+                running = False
+                for row in cursor.fetchall():
+                    if len(row) >= 8:
+                        info = str(row[7] or "").lower()
+                        tbl = table_name.lower()
+                        if "alter table" in info and tbl in info:
+                            running = True
+                            state = row[6] or "altering table"
+                            time_sec = row[5] or 0
+                            console.print(f"  [yellow]⏳ Query in progress on server:[/] {state} ({time_sec}s elapsed)... waiting...")
+                            break
+            if not running:
+                break
+            time.sleep(check_interval)
+        except Exception:
+            time.sleep(check_interval)
 
 
 @click.group(invoke_without_command=True)
@@ -311,15 +337,17 @@ def transfer_cmd(
                             # Restore any secondary indexes that might still be pending
                             pending_indexes = store.get_dropped_indexes(job_id, table_name)
                             if pending_indexes:
-                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} pending secondary indexes on [green]{table_name}[/]...")
-                                for p_idx in pending_indexes:
-                                    try:
-                                        writer.recreate_secondary_index(table_name, p_idx["definition"])
-                                        store.mark_index_restored(job_id, table_name, p_idx["index_name"])
-                                        console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
-                                    except Exception as r_err:
-                                        console.print(f"    [bold red]✖ Failed to restore index {p_idx['index_name']}: {r_err}[/]")
-                                        raise
+                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} pending secondary indexes on [green]{table_name}[/] (single-pass batch)...")
+                                wait_for_active_alter_table(dst_conn, table_name)
+                                definitions = [p["definition"] for p in pending_indexes]
+                                try:
+                                    writer.recreate_secondary_indexes_batch(table_name, definitions)
+                                    for p in pending_indexes:
+                                        store.mark_index_restored(job_id, table_name, p["index_name"])
+                                        console.print(f"    [green]✔ Restored index:[/] {p['index_name']}")
+                                except Exception as r_err:
+                                    console.print(f"    [bold red]✖ Failed to restore indexes on {table_name}: {r_err}[/]")
+                                    raise
                             if overall_task is not None:
                                 progress.advance(overall_task, 1)
                             continue
@@ -362,15 +390,17 @@ def transfer_cmd(
                             # Smart Indexing: Post-Stream Phase
                             pending_indexes = store.get_dropped_indexes(job_id, table_name)
                             if pending_indexes:
-                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes on [green]{table_name}[/] via bulk index creation...")
-                                for p_idx in pending_indexes:
-                                    try:
-                                        writer.recreate_secondary_index(table_name, p_idx["definition"])
-                                        store.mark_index_restored(job_id, table_name, p_idx["index_name"])
-                                        console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
-                                    except Exception as r_err:
-                                        console.print(f"    [bold red]✖ Failed to restore index {p_idx['index_name']}: {r_err}[/]")
-                                        raise
+                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes on [green]{table_name}[/] (single-pass batch)...")
+                                wait_for_active_alter_table(dst_conn, table_name)
+                                definitions = [p["definition"] for p in pending_indexes]
+                                try:
+                                    writer.recreate_secondary_indexes_batch(table_name, definitions)
+                                    for p in pending_indexes:
+                                        store.mark_index_restored(job_id, table_name, p["index_name"])
+                                        console.print(f"    [green]✔ Restored index:[/] {p['index_name']}")
+                                except Exception as r_err:
+                                    console.print(f"    [bold red]✖ Failed to restore indexes on {table_name}: {r_err}[/]")
+                                    raise
 
                             store.mark_completed(job_id, table_name)
                             if overall_task is not None:
@@ -599,14 +629,17 @@ def sync_cmd(
                     if auto_index and not dry_run:
                         pending_indexes = store.get_dropped_indexes(job_id, table_name)
                         if pending_indexes:
-                            console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes...")
-                            for p_idx in pending_indexes:
-                                try:
-                                    synchronizer.writer.recreate_secondary_index(table_name, p_idx["definition"])
+                            console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} secondary indexes on [green]{table_name}[/] (single-pass batch)...")
+                            wait_for_active_alter_table(dst_conn, table_name)
+                            definitions = [p_idx["definition"] for p_idx in pending_indexes]
+                            try:
+                                synchronizer.writer.recreate_secondary_indexes_batch(table_name, definitions)
+                                for p_idx in pending_indexes:
                                     store.mark_index_restored(job_id, table_name, p_idx["index_name"])
-                                except Exception as r_err:
-                                    console.print(f"    [red]✖ Failed to restore {p_idx['index_name']}: {r_err}[/]")
-                                    raise
+                                    console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
+                            except Exception as r_err:
+                                console.print(f"    [red]✖ Failed to restore indexes on {table_name}: {r_err}[/]")
+                                raise
 
                 synchronizer.writer.restore_session()
 
@@ -703,17 +736,22 @@ def indexes_restore_cmd(
         dst_conn = get_db_connection(dst_cfg, t_host, t_port)
         try:
             writer = DataWriter(dst_conn)
+            from collections import defaultdict
+            by_table = defaultdict(list)
             for idx in pending:
-                t_name = idx["table_name"]
-                i_name = idx["index_name"]
-                definition = idx["definition"]
-                console.print(f"  Rebuilding index [cyan]{i_name}[/] on [bold]{t_name}[/]...")
+                by_table[idx["table_name"]].append(idx)
+
+            for t_name, idx_list in by_table.items():
+                console.print(f"  Rebuilding {len(idx_list)} secondary indexes on [bold]{t_name}[/] (single-pass batch)...")
+                wait_for_active_alter_table(dst_conn, t_name)
+                definitions = [i["definition"] for i in idx_list]
                 try:
-                    writer.recreate_secondary_index(t_name, definition)
-                    store.mark_index_restored(idx["job_id"], t_name, i_name)
-                    console.print(f"    [green]✔ Successfully restored {i_name}[/]")
+                    writer.recreate_secondary_indexes_batch(t_name, definitions)
+                    for i in idx_list:
+                        store.mark_index_restored(i["job_id"], t_name, i["index_name"])
+                        console.print(f"    [green]✔ Successfully restored {i['index_name']}[/]")
                 except Exception as e:
-                    console.print(f"    [bold red]✖ Failed to restore {i_name}: {e}[/]")
+                    console.print(f"    [bold red]✖ Failed to restore indexes on {t_name}: {e}[/]")
             writer.restore_session()
         finally:
             dst_conn.close()
