@@ -260,17 +260,26 @@ class CheckpointStore:
             )
             conn.commit()
 
-    def get_dropped_indexes(self, job_id: str, table_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_dropped_indexes(self, job_id: Optional[str] = None, table_name: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            if table_name:
+            if table_name and job_id:
                 rows = conn.execute(
                     "SELECT * FROM conduit_indexes WHERE job_id = ? AND table_name = ? AND status = 'DROPPED'",
                     (job_id, table_name),
                 ).fetchall()
-            else:
+            elif table_name:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes WHERE table_name = ? AND status = 'DROPPED'",
+                    (table_name,),
+                ).fetchall()
+            elif job_id:
                 rows = conn.execute(
                     "SELECT * FROM conduit_indexes WHERE job_id = ? AND status = 'DROPPED'",
                     (job_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM conduit_indexes WHERE status = 'DROPPED'"
                 ).fetchall()
             return [dict(r) for r in rows]
 

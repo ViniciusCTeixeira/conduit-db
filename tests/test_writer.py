@@ -44,6 +44,28 @@ def test_writer_drop_and_recreate_index():
     mock_cursor.execute.assert_any_call("ALTER TABLE `rfb_empresas` ADD KEY `idx_rfb_emp_razao` (`razao_social`)")
 
 
+def test_writer_idempotent_index_operations():
+    import pymysql.err
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    writer = DataWriter(mock_conn)
+
+    # Simulate 1061 ER_DUP_KEYNAME when recreating index that already exists
+    def execute_side_effect(sql, *args):
+        if "ADD KEY" in sql:
+            raise pymysql.err.OperationalError(1061, "Duplicate key name 'idx_test'")
+        if "DROP INDEX" in sql:
+            raise pymysql.err.OperationalError(1091, "Can't DROP 'idx_test'; check that column/key exists")
+        return None
+
+    mock_cursor.execute.side_effect = execute_side_effect
+    assert writer.recreate_secondary_index("test_tbl", "KEY `idx_test` (`col`)") is True
+    assert writer.drop_secondary_index("test_tbl", "idx_test") is True
+
+
 def test_writer_batch_delete():
     mock_conn = MagicMock()
     mock_cursor = MagicMock()

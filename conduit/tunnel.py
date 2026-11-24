@@ -25,6 +25,7 @@ class TunnelManager:
             "ssh_username": ssh.username,
             "remote_bind_address": (db_config.host, db_config.port),
             "local_bind_address": ("127.0.0.1", 0),  # Bind to any free port
+            "set_keepalive": 30.0,
         }
 
         if ssh.private_key:

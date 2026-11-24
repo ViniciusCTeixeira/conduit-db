@@ -39,3 +39,5 @@ profiles:
     cfg = profiles["test_source"]
     assert cfg.password == "secret123"
     assert cfg.database == "test_db"
+    assert cfg.read_timeout is None
+    assert cfg.write_timeout is None

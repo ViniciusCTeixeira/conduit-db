@@ -46,3 +46,9 @@ def test_checkpoint_index_tracking(tmp_path: Path):
     all_tracked = store.list_all_indexes(job_id)
     assert len(all_tracked) == 1
     assert all_tracked[0]["status"] == "RESTORED"
+
+    # Test get_dropped_indexes without job_id
+    store.record_dropped_index(job_id, "rfb_empresas", "idx_rfb_emp_porte", "KEY `idx_rfb_emp_porte` (`porte`)")
+    global_dropped = store.get_dropped_indexes(table_name="rfb_empresas")
+    assert len(global_dropped) == 1
+    assert global_dropped[0]["index_name"] == "idx_rfb_emp_porte"

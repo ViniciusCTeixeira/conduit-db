@@ -60,8 +60,8 @@ class DatabaseConfig:
     database: str = ""
     charset: str = "utf8mb4"
     connect_timeout: int = 15
-    read_timeout: int = 60
-    write_timeout: int = 60
+    read_timeout: Optional[int] = None
+    write_timeout: Optional[int] = None
     ssh: SSHConfig = field(default_factory=SSHConfig)
 
     @classmethod
@@ -77,8 +77,8 @@ class DatabaseConfig:
             database=str(data.get("database", "")),
             charset=str(data.get("charset", "utf8mb4")),
             connect_timeout=int(data.get("connect_timeout", 15)),
-            read_timeout=int(data.get("read_timeout", 60)),
-            write_timeout=int(data.get("write_timeout", 60)),
+            read_timeout=int(data["read_timeout"]) if data.get("read_timeout") is not None else None,
+            write_timeout=int(data["write_timeout"]) if data.get("write_timeout") is not None else None,
             ssh=SSHConfig.from_dict(ssh_data),
         )
 

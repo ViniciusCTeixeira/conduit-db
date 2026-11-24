@@ -307,7 +307,19 @@ def transfer_cmd(
                         )
 
                         if cp.status == "COMPLETED" and not truncate:
-                            console.print(f"  [dim]Skipping already completed table: [cyan]{table_name}[/] ({cp.migrated_rows:,} rows)[/]")
+                            console.print(f"  [dim]Skipping already completed table data: [cyan]{table_name}[/] ({cp.migrated_rows:,} rows)[/]")
+                            # Restore any secondary indexes that might still be pending
+                            pending_indexes = store.get_dropped_indexes(job_id, table_name)
+                            if pending_indexes:
+                                console.print(f"  [cyan]🔨 Smart Indexing:[/] Rebuilding {len(pending_indexes)} pending secondary indexes on [green]{table_name}[/]...")
+                                for p_idx in pending_indexes:
+                                    try:
+                                        writer.recreate_secondary_index(table_name, p_idx["definition"])
+                                        store.mark_index_restored(job_id, table_name, p_idx["index_name"])
+                                        console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
+                                    except Exception as r_err:
+                                        console.print(f"    [bold red]✖ Failed to restore index {p_idx['index_name']}: {r_err}[/]")
+                                        raise
                             if overall_task is not None:
                                 progress.advance(overall_task, 1)
                             continue
@@ -347,10 +359,6 @@ def transfer_cmd(
                                 store.update_cursor(job_id, table_name, last_pk, len(rows_chunk))
                                 progress.advance(task_id, len(rows_chunk))
 
-                            store.mark_completed(job_id, table_name)
-                            if overall_task is not None:
-                                progress.advance(overall_task, 1)
-
                             # Smart Indexing: Post-Stream Phase
                             pending_indexes = store.get_dropped_indexes(job_id, table_name)
                             if pending_indexes:
@@ -362,6 +370,11 @@ def transfer_cmd(
                                         console.print(f"    [green]✔ Restored index:[/] {p_idx['index_name']}")
                                     except Exception as r_err:
                                         console.print(f"    [bold red]✖ Failed to restore index {p_idx['index_name']}: {r_err}[/]")
+                                        raise
+
+                            store.mark_completed(job_id, table_name)
+                            if overall_task is not None:
+                                progress.advance(overall_task, 1)
                         except Exception as e:
                             store.mark_failed(job_id, table_name, str(e))
                             console.print(f"[bold red]Failed on table {table_name}: {e}[/]")
@@ -593,6 +606,7 @@ def sync_cmd(
                                     store.mark_index_restored(job_id, table_name, p_idx["index_name"])
                                 except Exception as r_err:
                                     console.print(f"    [red]✖ Failed to restore {p_idx['index_name']}: {r_err}[/]")
+                                    raise
 
                 synchronizer.writer.restore_session()
 
@@ -672,7 +686,7 @@ def indexes_restore_cmd(
     dst_cfg = profiles[target]
     store = CheckpointStore(state_db)
 
-    pending = store.get_dropped_indexes("", table_name=table) if table else [
+    pending = store.get_dropped_indexes(table_name=table) if table else [
         idx for idx in store.list_all_indexes() if idx["status"] == "DROPPED"
     ]
 
